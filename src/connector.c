@@ -34,129 +34,118 @@
 #include "socks.c"
 #include "pluginHandler.c"
 
-// the epoll file descriptor
-int epfd;
+#define BUFFER_SIZE 512
+#define MESSAGE_SIZE 5000
+#define EPOLL_MAX_EVENTS 10
 
 pthread_mutex_t mutex_epfd = PTHREAD_MUTEX_INITIALIZER;
+int epfd;
 
-int *start_connector(void *agentI) {
+void initialize_connector(struct agentInfo *aInfo);
+void handle_write_event(int fd);
+void handle_read_event(int fd);
+
+int* start_connector(void *agentI) {
 	struct agentInfo *aInfo = agentI;
-	loadMethods();
-	
-	//wait for sync
-	sem_wait(aInfo->startB);
-	printf("\t+Connector Service started [%u]\n", aInfo->mPort);
-
-	openAckFile();
-	onInitPlugin();
-	
-	// internal variables definition
-	int i, count, datacount;
-	
-	//buf to hold the response
-	char buffer[512];
-	int buffersize = sizeof(buffer);
-
-	// epoll structure that will contain the current network socket and event when epoll wakes up
-	static struct epoll_event *events;
-	static struct epoll_event event_mask;
-	
-	// create the special epoll file descriptor
-	pthread_mutex_lock(&mutex_epfd);
-	epfd = epoll_create(MAX_SOCKS);
-	pthread_mutex_unlock(&mutex_epfd);
-
-	// allocate enough memory to store all the events in the "events" structure
+    initialize_connector(aInfo);
+    static struct epoll_event *events;
 	if (NULL == (events = calloc(MAX_SOCKS, sizeof(struct epoll_event)))) {
 		perror("calloc events");
 		exit(1);
 	};
 
-	while (endOfScan == FALSE) {
-
-		count = epoll_wait((int )epfd, events, MAX_SOCKS, -1);
-		for (i = 0; i < count; i++) {
-
-			if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLRDHUP) || (events[i].events & EPOLLHUP)) //socket is erroneous
-			{
+    while (!endOfScan) {
+        int event_count = epoll_wait(epfd, events, EPOLL_MAX_EVENTS, -1);
+        for (int i = 0; i < event_count; i++)
+            if (events[i].events & (EPOLLERR | EPOLLRDHUP | EPOLLHUP))
 				deleteSock(epfd, events[i].data.fd);
-			}
+            else if (events[i].events & EPOLLOUT)
+                handle_write_event(events[i].data.fd);
+            else if (events[i].events & EPOLLIN)
+                handle_read_event(events[i].data.fd);
+    }
 
-			if (events[i].events & EPOLLOUT) //we can write
-			{
-				if (socket_check(events[i].data.fd) != 0) {
-					deleteSock(epfd, events[i].data.fd);
-					continue;
-				} else {
-					// Request
-					int porr = (int)getPortBySock(events[i].data.fd);
-					char *message= malloc(sizeof(char)*80);
-
-					getServiceInput(porr, message);
-					int messagelength = strlen(message);
-					if ((datacount = send(events[i].data.fd, message, messagelength, 0)) < 0) {
-						//printf("send failed");
-						continue;
-					} else {
-						event_mask.events = EPOLLIN | EPOLLRDHUP | EPOLLERR;
-						event_mask.data.fd = events[i].data.fd;
-						if (epoll_ctl((int) epfd, EPOLL_CTL_MOD, events[i].data.fd, &event_mask) != 0) {
-							deleteSock(epfd, events[i].data.fd);
-							continue;
-						}
-					}
-					if (message != NULL) {
-						free(message);
-					}
-				}
-			}
-			if ((events[i].events & EPOLLIN)) //we can read
-			{
-				if (socket_check(events[i].data.fd) != 0) {
-					deleteSock(epfd, events[i].data.fd);
-					continue;
-				} else {
-					struct host hostInfo;
-					hostInfo.port =  (int)getPortBySock(events[i].data.fd);
-					hostInfo.ip =  getHostBySock(events[i].data.fd);
-					if (hostInfo.port == -1 || strlen(hostInfo.ip) == 0){
-						deleteSock(epfd, events[i].data.fd);
-						continue;
-					}
-					memset(buffer, 0x0, buffersize);
-					char *msg;
-					msg = (char *) malloc(5000);
-					if (msg != NULL) {
-						int data = 0, datacount = 0;
-						while ((datacount = recv(events[i].data.fd, buffer, buffersize, 0)) > 0) {
-							buffer[datacount] = '\0';
-							if (data + datacount > 4999) {
-								break;
-							}
-							if (data == 0) {
-								strncpy(msg, buffer,4999);
-							} else {
-								strncat(msg, buffer,4999);
-							}
-							data = data + datacount;
-						}
-						if (data > 0) {
-							persistAck(hostInfo.ip,hostInfo.port,msg);
-							provideOutput(hostInfo.ip, hostInfo.port, msg);
-						}
-						if (msg!= NULL) {
-							free(msg);
-						}
-					}
-					deleteSock(epfd, events[i].data.fd);
-				}
-			}
-			if (events[i].events & EPOLLERR) { //error
-				continue;
-			}
-		}
-	}
-	onStopPlugin();
-	return 0;
+    onStopPlugin();
+    pthread_mutex_destroy(&mutex_epfd);
+    close(epfd);
+    return 0;
 }
 
+
+void handle_write_event(int fd) {
+    if (socket_check(fd) != 0) {
+        deleteSock(epfd, fd);
+        return;
+    }
+
+    int port = (int)getPortBySock(fd);
+    char *message = malloc(sizeof(char) * 80);
+
+    if (message == NULL) {
+        perror("Failed to allocate memory for message");
+        return;
+    }
+
+    getServiceInput(port, message);
+    int message_length = strlen(message);
+
+    if (send(fd, message, message_length, 0) < 0) {
+        free(message);
+        return;
+    }
+
+    struct epoll_event event_mask;
+    event_mask.events = EPOLLIN | EPOLLRDHUP | EPOLLERR;
+    event_mask.data.fd = fd;
+
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &event_mask) != 0) {
+        deleteSock(epfd, fd);
+    }
+
+    free(message);
+}
+
+void handle_read_event(int fd) {
+    if (socket_check(fd) != 0) {
+        deleteSock(epfd, fd);
+        return;
+    }
+
+    struct host hostInfo;
+    hostInfo.port = (int)getPortBySock(fd);
+    hostInfo.ip = getHostBySock(fd);
+
+    if (hostInfo.port == -1 || strlen(hostInfo.ip) == 0) {
+        deleteSock(epfd, fd);
+        return;
+    }
+
+    char buffer[BUFFER_SIZE];
+    memset(buffer, 0x0, BUFFER_SIZE);
+    char *msg = malloc(MESSAGE_SIZE);
+
+    if (msg == NULL) {
+        perror("Failed to allocate memory for msg");
+        deleteSock(epfd, fd);
+        return;
+    }
+
+    int total_data = 0, data_count = 0;
+
+    while ((data_count = recv(fd, buffer, BUFFER_SIZE, 0)) > 0) {
+        if (total_data + data_count > MESSAGE_SIZE - 1) break;
+
+        if (total_data == 0) strncpy(msg, buffer, MESSAGE_SIZE - 1);
+        else strncat(msg, buffer, MESSAGE_SIZE - 1 - total_data);
+
+        total_data += data_count;
+    }
+
+    if (total_data > 0) {
+        persistAck(hostInfo.ip, hostInfo.port, msg);
+        provideOutput(hostInfo.ip, hostInfo.port, msg);
+    }
+
+    free(msg);
+    deleteSock(epfd, fd);
+}
